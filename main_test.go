@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 var canonicalShapeRe = regexp.MustCompile(`^(ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -471,13 +472,11 @@ func TestRouteForModelUnknownInference(t *testing.T) {
 // gate: canonical IDs
 // =========================================================================
 
-func TestCanonicalIDSesShape(t *testing.T) {
-	id := canonicalID("ses", "test-source")
-	if !canonicalShapeRe.MatchString(id) {
-		t.Fatalf("id = %q, want ses_<12hex><14alnum>", id)
-	}
-	if len(id) != 30 {
-		t.Fatalf("id length = %d, want 30", len(id))
+func TestCanonicalIDChatcmplShape(t *testing.T) {
+	id := canonicalID("chatcmpl", "test-source")
+	shape := regexp.MustCompile(`^chatcmpl_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+	if !shape.MatchString(id) {
+		t.Fatalf("id = %q, want chatcmpl_<12hex><14alnum>", id)
 	}
 }
 
@@ -492,18 +491,27 @@ func TestCanonicalIDMsgShape(t *testing.T) {
 }
 
 func TestCanonicalIDDeterministic(t *testing.T) {
-	a := canonicalID("ses", "source")
-	b := canonicalID("ses", "source")
+	a := canonicalID("msg", "source")
+	b := canonicalID("msg", "source")
 	if a != b {
 		t.Fatal("canonicalID is not deterministic")
 	}
 }
 
 func TestCanonicalIDDistinctSources(t *testing.T) {
-	a := canonicalID("ses", "source-a")
-	b := canonicalID("ses", "source-b")
+	a := canonicalID("msg", "source-a")
+	b := canonicalID("msg", "source-b")
 	if a == b {
 		t.Fatal("distinct sources must produce distinct ids")
+	}
+}
+
+// TestCanonicalIDSessionPrefixIsNotGateValid documents why sessions must not
+// be minted by canonicalID: the hash-derived hex field does not carry the
+// 0xFFE low bits the free-tier gate reads.
+func TestCanonicalIDSessionPrefixIsNotGateValid(t *testing.T) {
+	if isGateSessionID(canonicalID("ses", "real-client")) {
+		t.Fatal("hash-derived session id unexpectedly passed the gate check")
 	}
 }
 
@@ -520,9 +528,9 @@ func TestResolveSessionFromClientHeader(t *testing.T) {
 	}
 }
 
-func TestResolveSessionFromExistingCanonical(t *testing.T) {
+func TestResolveSessionPassesGateValidClientValue(t *testing.T) {
 	resetConfig(t, testConfig())
-	existing := canonicalID("ses", "real-client")
+	existing := newOfficialSessionID()
 	req := &executorRequest{
 		Model:   "mimo-v2.6-flash-free",
 		Payload: chatPayload("mimo-v2.6-flash-free", "hello"),
@@ -531,6 +539,68 @@ func TestResolveSessionFromExistingCanonical(t *testing.T) {
 	session, ok := resolveSession(req)
 	if !ok || session != existing {
 		t.Fatalf("session = %q, want %q", session, existing)
+	}
+}
+
+// TestResolveSessionRemintsUngatedClientValue covers the regression that made
+// every free-tier request fail with "403 FreeTierError": a client value that
+// only looks canonical (hash-derived hex field) must be replaced by a gate
+// valid id, and the replacement must stay stable for that conversation.
+func TestResolveSessionRemintsUngatedClientValue(t *testing.T) {
+	resetConfig(t, testConfig())
+	existing := canonicalID("ses", "real-client")
+	if isGateSessionID(existing) {
+		t.Fatalf("fixture %q unexpectedly passes the gate check", existing)
+	}
+	req := &executorRequest{
+		Model:   "mimo-v2.6-flash-free",
+		Payload: chatPayload("mimo-v2.6-flash-free", "hello"),
+		Headers: map[string][]string{targetSessionHeader: {existing}},
+	}
+	session, ok := resolveSession(req)
+	if !ok || session == existing {
+		t.Fatalf("session = %q, want a re-minted id", session)
+	}
+	if !isGateSessionID(session) {
+		t.Fatalf("re-minted session %q is not gate valid", session)
+	}
+	again, _ := resolveSession(req)
+	if again != session {
+		t.Fatalf("re-minted session id is not stable: %q then %q", session, again)
+	}
+}
+
+// TestResolveSessionAlwaysGateValid walks every resolution path: the returned
+// id must satisfy the gate invariant the upstream enforces.
+func TestResolveSessionAlwaysGateValid(t *testing.T) {
+	resetConfig(t, testConfig())
+	requests := []*executorRequest{
+		{
+			Model:   "mimo-v2.6-flash-free",
+			Payload: chatPayload("mimo-v2.6-flash-free", "hello"),
+			Headers: map[string][]string{"Session-Id": {"codex-session-1"}},
+		},
+		{
+			Model:    "mimo-v2.6-flash-free",
+			Payload:  chatPayload("mimo-v2.6-flash-free", "hello"),
+			Headers:  map[string][]string{},
+			Metadata: map[string]any{"canonical_session_id": "claude:probe-1"},
+		},
+		{
+			Model:    "mimo-v2.6-flash-free",
+			Payload:  chatPayload("mimo-v2.6-flash-free", "unique-opening"),
+			Headers:  map[string][]string{},
+			Metadata: map[string]any{},
+		},
+	}
+	for i, req := range requests {
+		session, ok := resolveSession(req)
+		if !ok {
+			t.Fatalf("request %d did not resolve a session", i)
+		}
+		if !isGateSessionID(session) {
+			t.Fatalf("request %d resolved gate-invalid session %q", i, session)
+		}
 	}
 }
 
@@ -1679,6 +1749,427 @@ func TestConfigureParsesSemicolonSeparatedKeys(t *testing.T) {
 	for i, k := range want {
 		if cfg.APIKeys[i] != k {
 			t.Fatalf("APIKeys = %v, want %v", cfg.APIKeys, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stream resume (automatic reconnect of a broken upstream stream)
+// ---------------------------------------------------------------------------
+
+func TestStreamResumeMonitorChatFrames(t *testing.T) {
+	m := &streamResumeMonitor{}
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}` + "\n\n"))
+	if m.sawFinish {
+		t.Fatal("role chunk must not mark the stream terminal")
+	}
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"content":"你"}}]}` + "\n\n"))
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"content":"好"}}]}` + "\n\n"))
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n"))
+	if !m.sawFinish {
+		t.Fatal("finish_reason chunk must mark the stream terminal")
+	}
+	if got := m.partialText(); got != "你好" {
+		t.Fatalf("partialText = %q, want %q", got, "你好")
+	}
+	if m.sawToolCall {
+		t.Fatal("no tool calls were observed")
+	}
+}
+
+func TestStreamResumeMonitorIgnoresHeartbeatShape(t *testing.T) {
+	m := &streamResumeMonitor{}
+	m.observeChatFrame([]byte(`{"id":"chatcmpl_x","choices":[{"index":0,"delta":{},"finish_reason":null}]}`))
+	if m.sawFinish || m.partialText() != "" || m.sawToolCall {
+		t.Fatal("heartbeat-shaped chunk must not affect the monitor")
+	}
+}
+
+func TestStreamResumeMonitorToolCall(t *testing.T) {
+	m := &streamResumeMonitor{}
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}` + "\n\n"))
+	if !m.sawToolCall {
+		t.Fatal("tool_calls delta must flag the monitor")
+	}
+}
+
+func TestStreamResumeMonitorBoundedTail(t *testing.T) {
+	m := &streamResumeMonitor{}
+	big := strings.Repeat("a", 3*streamResumeMaxPartialBytes)
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"content":"` + big + `"}}]}` + "\n\n"))
+	if got := m.partialText(); !strings.HasPrefix(got, streamResumeElidedMarker) {
+		t.Fatalf("oversized partial must be tail-capped, len=%d", len(got))
+	}
+}
+
+func TestAppendContinuationPayloadChat(t *testing.T) {
+	base := chatPayload("deepseek-v4.1-flash-free", "写个东西")
+	next, err := appendContinuationPayload(base, "已经写到一半")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(next, &root); err != nil {
+		t.Fatal(err)
+	}
+	if len(root.Messages) != 3 {
+		t.Fatalf("messages = %d, want 3", len(root.Messages))
+	}
+	if root.Messages[1].Role != "assistant" || root.Messages[1].Content != "已经写到一半" {
+		t.Fatalf("assistant partial = %+v", root.Messages[1])
+	}
+	if root.Messages[2].Role != "user" || !strings.Contains(root.Messages[2].Content, "Continue the unfinished task") {
+		t.Fatalf("resume instruction = %+v", root.Messages[2])
+	}
+}
+
+func TestAppendContinuationPayloadResponsesInput(t *testing.T) {
+	base := responsesPayload("muse-spark-1.3-contributor-free", "hello")
+	next, err := appendContinuationPayload(base, "partial answer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Input []struct {
+			Type    string          `json:"type"`
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(next, &root); err != nil {
+		t.Fatal(err)
+	}
+	if len(root.Input) != 3 {
+		t.Fatalf("input items = %d, want 3", len(root.Input))
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(root.Input[1].Content, &parts); err != nil {
+		t.Fatal(err)
+	}
+	if root.Input[1].Role != "assistant" || parts[0].Type != "output_text" || parts[0].Text != "partial answer" {
+		t.Fatalf("assistant item = %+v %+v", root.Input[1], parts)
+	}
+	if err := json.Unmarshal(root.Input[2].Content, &parts); err != nil {
+		t.Fatal(err)
+	}
+	if root.Input[2].Role != "user" || parts[0].Type != "input_text" || !strings.Contains(parts[0].Text, "Continue the unfinished task") {
+		t.Fatalf("user resume item = %+v %+v", root.Input[2], parts)
+	}
+}
+
+func TestAppendContinuationPayloadEmptyPartialReplays(t *testing.T) {
+	base := chatPayload("deepseek-v4.1-flash-free", "hi")
+	next, err := appendContinuationPayload(base, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(next) != string(base) {
+		t.Fatal("empty partial must return the payload unchanged")
+	}
+}
+
+func TestAppendContinuationPayloadStringInput(t *testing.T) {
+	base := []byte(`{"model":"m","input":"original question"}`)
+	next, err := appendContinuationPayload(base, "partial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Input string `json:"input"`
+	}
+	if err := json.Unmarshal(next, &root); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(root.Input, "original question") || !strings.Contains(root.Input, "partial") || !strings.Contains(root.Input, "Continue the unfinished task") {
+		t.Fatalf("string input not extended: %q", root.Input)
+	}
+}
+
+func TestAppendContinuationPayloadUnsupportedShape(t *testing.T) {
+	if _, err := appendContinuationPayload([]byte("not json"), "partial"); err == nil {
+		t.Fatal("non-JSON payload must fail")
+	}
+	if _, err := appendContinuationPayload([]byte(`{"model":"m"}`), "partial"); err == nil {
+		t.Fatal("payload without messages/input must fail")
+	}
+}
+
+func TestSSEReassemblerSawDone(t *testing.T) {
+	r := &sseReassembler{
+		rawData: false,
+		emit:    func(frame []byte) error { return nil },
+	}
+	if err := r.write([]byte("data: {\"x\":1}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if r.sawDone {
+		t.Fatal("no [DONE] yet")
+	}
+	if err := r.write([]byte("data: [DONE]\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !r.sawDone {
+		t.Fatal("[DONE] terminator must set sawDone")
+	}
+}
+
+func TestStreamRetryDelayCapped(t *testing.T) {
+	if got := streamRetryDelay(1); got != time.Second {
+		t.Fatalf("delay(1) = %v", got)
+	}
+	if got := streamRetryDelay(2); got != 2*time.Second {
+		t.Fatalf("delay(2) = %v", got)
+	}
+	if got := streamRetryDelay(3); got != 4*time.Second {
+		t.Fatalf("delay(3) = %v", got)
+	}
+	if got := streamRetryDelay(9); got != 8*time.Second {
+		t.Fatalf("delay(9) = %v, want capped 8s", got)
+	}
+}
+
+func TestStreamRetryableStatus(t *testing.T) {
+	for _, s := range []int{500, 502, 503, 504, 408} {
+		if !streamRetryableStatus(s) {
+			t.Fatalf("status %d should be retryable", s)
+		}
+	}
+	for _, s := range []int{200, 400, 401, 403, 404, 429} {
+		if streamRetryableStatus(s) {
+			t.Fatalf("status %d should NOT be retryable", s)
+		}
+	}
+}
+
+func TestConfigureParsesStreamRetries(t *testing.T) {
+	payload, err := json.Marshal(struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}{[]byte("stream-retries: 5\n")})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := configure(payload); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	t.Cleanup(func() { storeConfig(defaultPluginConfig()) })
+	if got := loadedConfig().StreamRetries; got != 5 {
+		t.Fatalf("StreamRetries = %d, want 5", got)
+	}
+
+	payload, _ = json.Marshal(struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}{[]byte("stream-retries: 99\n")})
+	if err := configure(payload); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	if got := loadedConfig().StreamRetries; got != 10 {
+		t.Fatalf("StreamRetries clamp = %d, want 10", got)
+	}
+}
+
+func TestResumeTailStringUTF8Boundary(t *testing.T) {
+	s := strings.Repeat("汉", streamResumeMaxPartialBytes/3+10) // 3 bytes each
+	tail := resumeTailString(s, 30)
+	if !utf8.ValidString(tail) {
+		t.Fatal("tail cut a rune in half")
+	}
+	if got := resumeTailString("short", 30); got != "short" {
+		t.Fatalf("short string changed: %q", got)
+	}
+}
+
+func TestTrimJSONEnvelopeStripsBOM(t *testing.T) {
+	bom := []byte{0xEF, 0xBB, 0xBF}
+
+	if got := string(trimJSONEnvelope(append(bom, []byte(`{"model":"m"}`)...))); got != `{"model":"m"}` {
+		t.Fatalf("BOM not stripped: %q", got)
+	}
+	if got := string(trimJSONEnvelope([]byte("  \n{\"a\":1}\n "))); got != `{"a":1}` {
+		t.Fatalf("whitespace not trimmed: %q", got)
+	}
+}
+
+func TestStreamResumeMonitorDanglingLeadIn(t *testing.T) {
+	frm := func(text string) *streamResumeMonitor {
+		m := &streamResumeMonitor{}
+		raw, _ := json.Marshal(map[string]any{"choices": []any{
+			map[string]any{"delta": map[string]any{"content": text}},
+		}})
+		m.observeChatFrame([]byte("data: " + string(raw) + "\n\n"))
+		return m
+	}
+	if !frm("编辑破坏了顺序，直接重写脚本：").danglingLeadIn() {
+		t.Fatal("text ending with a full-width colon must be dangling")
+	}
+	if !frm("接下来：").danglingLeadIn() {
+		t.Fatal("colon must be dangling")
+	}
+	if !frm("```python\nprint(1)").danglingLeadIn() {
+		t.Fatal("unclosed code fence must be dangling")
+	}
+	if frm("已经写完了。").danglingLeadIn() {
+		t.Fatal("complete sentence must not be dangling")
+	}
+	if (&streamResumeMonitor{}).danglingLeadIn() {
+		t.Fatal("empty text must not be dangling")
+	}
+}
+
+func TestPrepareUpstreamBodyAcceptsBOMPayload(t *testing.T) {
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	req := executorRequest{
+		Model:   "mimo-v2.6-flash-free",
+		Payload: append(bom, chatPayload("mimo-v2.6-flash-free", "hi")...),
+	}
+	if _, err := prepareUpstreamBody(req, modelRoute{Model: "mimo-v2.6-flash-free", Endpoint: "chat"}); err != nil {
+		t.Fatalf("BOM payload rejected: %v", err)
+	}
+}
+
+func TestStreamResumeMonitorAnyOutput(t *testing.T) {
+	m := &streamResumeMonitor{}
+	if m.anyOutput() {
+		t.Fatal("fresh monitor must report no output")
+	}
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"content":"x"}}]}` + "\n\n"))
+	if !m.anyOutput() {
+		t.Fatal("text must count as output")
+	}
+	tc := &streamResumeMonitor{}
+	tc.observeChatFrame([]byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}` + "\n\n"))
+	if !tc.anyOutput() {
+		t.Fatal("tool call must count as output")
+	}
+}
+
+func TestEmptyCompletionDetection(t *testing.T) {
+	empty := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":""}}]}`)
+	if !isEmptyCompletion(empty) {
+		t.Fatal("empty content must be detected")
+	}
+	hasText := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]}`)
+	if isEmptyCompletion(hasText) {
+		t.Fatal("content must not be reported empty")
+	}
+	hasTool := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1"}]}}]}`)
+	if isEmptyCompletion(hasTool) {
+		t.Fatal("tool call must not be reported empty")
+	}
+}
+
+func TestConverterRecoversToolCallFromCompletedPayload(t *testing.T) {
+	// Some gateways stream a short prefix and then deliver the authoritative
+	// items only inside response.completed; the tool call must not be lost.
+	c := newResponsesChatStreamConverter("mimo-v2.6-flash-free")
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}]}}`)
+	outs, err := c.convert(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawTool, sawFinish bool
+	for _, out := range outs {
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []struct {
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(out, &chunk); err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range chunk.Choices {
+			if len(ch.Delta.ToolCalls) > 0 {
+				sawTool = true
+				call := ch.Delta.ToolCalls[0]
+				if call.ID != "call_1" || call.Function.Name != "bash" || call.Function.Arguments != `{"command":"ls"}` {
+					t.Fatalf("tool call = %+v", call)
+				}
+			}
+			if ch.FinishReason != nil && *ch.FinishReason != "" {
+				sawFinish = true
+				if *ch.FinishReason != "tool_calls" {
+					t.Fatalf("finish = %q, want tool_calls", *ch.FinishReason)
+				}
+			}
+		}
+	}
+	if !sawTool || !sawFinish {
+		t.Fatalf("sawTool=%v sawFinish=%v", sawTool, sawFinish)
+	}
+}
+
+func TestConverterRecoversTextFromCompletedPayload(t *testing.T) {
+	c := newResponsesChatStreamConverter("mimo-v2.6-flash-free")
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"最终答复"}]}]}}`)
+	outs, err := c.convert(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawText bool
+	for _, out := range outs {
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(out, &chunk); err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range chunk.Choices {
+			if ch.Delta.Content == "最终答复" {
+				sawText = true
+			}
+		}
+	}
+	if !sawText {
+		t.Fatal("text delivered only in response.completed must be recovered")
+	}
+}
+
+func TestConverterDoesNotDuplicateStreamedItems(t *testing.T) {
+	// When the items were already streamed, the completion payload must not
+	// re-emit them.
+	c := newResponsesChatStreamConverter("mimo-v2.6-flash-free")
+	if _, err := c.convert([]byte(`{"type":"response.output_text.delta","item_id":"msg_1","delta":"hi"}`)); err != nil {
+		t.Fatal(err)
+	}
+	outs, err := c.convert([]byte(`{"type":"response.completed","response":{"id":"resp_3","status":"completed","output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"hi"}]}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range outs {
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(out, &chunk); err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range chunk.Choices {
+			if ch.Delta.Content != "" {
+				t.Fatalf("streamed text re-emitted: %q", ch.Delta.Content)
+			}
 		}
 	}
 }

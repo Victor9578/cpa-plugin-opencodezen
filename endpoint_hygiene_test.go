@@ -745,29 +745,91 @@ func TestNewOfficialSessionID(t *testing.T) {
 	if !canonicalSessionRe.MatchString(id) {
 		t.Fatalf("id %q does not match the official shape", id)
 	}
-	// The descending timestamp must decode to roughly now. The official
-	// format keeps a 36-bit millisecond timestamp (wraps every ~2.18 years),
-	// so decoding resolves the wraparound against the current time.
-	inverted, err := strconv.ParseUint(id[4:16], 16, 64)
+	if !isGateSessionID(id) {
+		t.Fatalf("id %q fails the free-tier gate (low 12 bits must be %s)", id, gateSessionLowHex)
+	}
+	// The descending timestamp must decode to roughly now. The hex field
+	// keeps a 36-bit millisecond component that counts down from the epoch
+	// constant, so decoding resolves the wraparound against the current time.
+	field, err := strconv.ParseUint(id[4:16], 16, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	combined := ^inverted & 0xFFFFFFFFFFFF
-	ts36 := int64(combined >> 12)
 	const mod36 = int64(1) << 36
-	now := time.Now().UnixMilli()
-	candidate := now - now%mod36 + ts36
-	if candidate > now+mod36/2 {
-		candidate -= mod36
-	} else if candidate < now-mod36/2 {
-		candidate += mod36
+	expected := ((zenSessionEpochMillis-time.Now().UnixMilli())%mod36 + mod36) % mod36
+	delta := (int64(field>>12) - expected) % mod36
+	if delta < 0 {
+		delta += mod36
 	}
-	if delta := now - candidate; delta < -time.Minute.Milliseconds() || delta > time.Minute.Milliseconds() {
-		t.Fatalf("session id timestamp decodes to %dms from now", delta)
+	if delta > 5000 && delta < mod36-5000 {
+		t.Fatalf("session id timestamp field is off by %dms", delta)
 	}
 	// Two ids differ (random suffix).
 	if newOfficialSessionID() == id {
 		t.Fatal("session ids must be unique")
+	}
+}
+
+// TestOfficialSessionIDMatchesRealClient pins the encoding to ids observed
+// from the official OpenCode client: the timestamp field plus the creation
+// millisecond equals the epoch constant, and the low 12 bits are always 0xFFE.
+func TestOfficialSessionIDMatchesRealClient(t *testing.T) {
+	samples := []struct {
+		id        string
+		unixMilli int64
+	}{
+		{"ses_f390f32e4ffeAZG1xXDw56ko1q", 1790044065052},
+		{"ses_fc7b694ecffeul9nCWYfheWe5J", 1787650730772},
+		{"ses_fc42c626effe4bCNliD9ZNg227", 1787710119314},
+	}
+	for _, sample := range samples {
+		if !isGateSessionID(sample.id) {
+			t.Fatalf("real client id %q rejected by the gate check", sample.id)
+		}
+		field, err := strconv.ParseUint(sample.id[4:16], 16, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := int64(field>>12) + sample.unixMilli; got != zenSessionEpochMillis {
+			t.Fatalf("id %q decodes to epoch %d, want %d", sample.id, got, zenSessionEpochMillis)
+		}
+		if low := field & 0xFFF; low != 0xFFE {
+			t.Fatalf("id %q low bits = %#x, want 0xFFE", sample.id, low)
+		}
+	}
+}
+
+func TestIsGateSessionID(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{"ses_000000000ffeaBCDEFghijklmn", true},
+		{"ses_123456789abcABCDEFghijklmn", false},
+		{"ses_000000000000ABCDEFghijklmn", false},
+		{"ses_000000000ffe", false},
+		{"msg_000000000ffeABCDEFghijklmn", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isGateSessionID(tc.id); got != tc.want {
+			t.Fatalf("isGateSessionID(%q) = %v, want %v", tc.id, got, tc.want)
+		}
+	}
+}
+
+// TestSessionIDForSourceReusesID documents that one conversation keeps one
+// session id, so affinity and the upstream prompt cache survive every turn.
+func TestSessionIDForSourceReusesID(t *testing.T) {
+	first := sessionIDForSource("conversation-a")
+	if !isGateSessionID(first) {
+		t.Fatalf("session id %q is not gate valid", first)
+	}
+	if second := sessionIDForSource("conversation-a"); second != first {
+		t.Fatalf("same source produced %q then %q", first, second)
+	}
+	if other := sessionIDForSource("conversation-b"); other == first {
+		t.Fatal("distinct sources must not share a session id")
 	}
 }
 
@@ -779,6 +841,9 @@ func TestRefreshGateSession(t *testing.T) {
 	session := headers[targetSessionHeader][0]
 	if !canonicalSessionRe.MatchString(session) || session == "ses_old" {
 		t.Fatalf("refreshGateSession left %q", session)
+	}
+	if !isGateSessionID(session) {
+		t.Fatalf("refreshGateSession minted a gate-invalid id %q", session)
 	}
 	if headers["X-Session-Affinity"][0] != session || headers["X-Session-Id"][0] != session {
 		t.Fatalf("affinity headers not aligned: %v", headers)
